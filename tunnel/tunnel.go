@@ -229,10 +229,33 @@ func RuleProviders() map[string]P.RuleProvider {
 // UpdateProxies handle update proxies
 func UpdateProxies(newProxies map[string]C.Proxy, newProviders map[string]P.ProxyProvider) {
 	configMux.Lock()
+	oldProxies := proxies
 	proxies = newProxies
 	providers = newProviders
 	invalidateAllProxies()
 	configMux.Unlock()
+	closeReplacedProxies(oldProxies, newProxies)
+}
+
+// closeReplacedProxies releases the outbounds a config reload dropped or
+// rebuilt. Without it a replaced outbound lives until the garbage collector
+// reaches it, and while it lives it keeps its sockets and timers: a WireGuard
+// outbound keeps handshaking with the server and steals the session from its
+// successor every few seconds (GhostHop A31-BUG-4). Every reload builds fresh
+// outbound instances, so an old proxy is kept only if the new map still holds
+// the very same instance.
+func closeReplacedProxies(oldProxies, newProxies map[string]C.Proxy) {
+	for name, old := range oldProxies {
+		if old == nil {
+			continue
+		}
+		if kept, ok := newProxies[name]; ok && kept == old {
+			continue
+		}
+		if err := old.Close(); err != nil {
+			log.Warnln("Close replaced proxy [%s] failed: %s", name, err)
+		}
+	}
 }
 
 func UpdateListeners(newListeners map[string]C.InboundListener) {
