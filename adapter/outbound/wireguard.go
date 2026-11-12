@@ -18,7 +18,6 @@ import (
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/proxydialer"
 	"github.com/metacubex/mihomo/component/resolver"
-	"github.com/metacubex/mihomo/component/slowdown"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/constant/features"
 	"github.com/metacubex/mihomo/dns"
@@ -40,31 +39,49 @@ const (
 	ipStackAuto   = "auto"
 	ipStackGVisor = "gvisor"
 	ipStackMips   = "mips"
+
+	// Active window within which an AmneziaWG outbound forces a fresh CPS
+	// (I1..I5 + junk) handshake on network roam instead of sending a bare
+	// transport keepalive that stateful DPI drops on a new CGNAT 5-tuple.
+	wgActiveRoamWindow = 3 * time.Minute
+	// Covers both tai64n.Now() 16.777ms quantization and server-side 20ms
+	// HandshakeInitationRate anti-flood when two network monitors coalesce.
+	wgMinRebindHandshakeGap = 30 * time.Millisecond
+	wgNetWarnThrottle       = 2 * time.Second
 )
 
 type wireguardGoDevice interface {
 	Close()
+	Up() error
 	IpcSet(uapiConf string) error
 	BindUpdate() error
 	SendKeepalivesToPeersWithCurrentKeypair()
 }
 
+type roamingHandshakeDevice interface {
+	ReinitiatePeerHandshake(hexPublicKey string) error
+}
+
 type WireGuard struct {
 	*Base
-	bind      *wireguard.ClientBind
-	device    wireguardGoDevice
-	tunDevice wireguardDevice
-	resolver  resolver.Resolver
+	bind       *wireguard.ClientBind
+	bindDialer *wgBindDialer
+	device     wireguardGoDevice
+	tunDevice  wireguardDevice
+	resolver   resolver.Resolver
 
-	runCtx        context.Context
-	runCancel     context.CancelFunc
-	deviceMutex   sync.Mutex
-	initOk        atomic.Bool
-	initMutex     sync.Mutex
-	initErr       error
-	option        WireGuardOption
-	connectAddr   M.Socksaddr
-	localPrefixes []netip.Prefix
+	runCtx              context.Context
+	runCancel           context.CancelFunc
+	deviceMutex         sync.Mutex
+	initOk              atomic.Bool
+	initMutex           sync.Mutex
+	initErr             error
+	option              WireGuardOption
+	connectAddr         M.Socksaddr
+	localPrefixes       []netip.Prefix
+	lastActiveNano      atomic.Int64
+	lastNetWarnNano     atomic.Int64
+	lastRebindHandshake time.Time
 
 	serverAddrMap   map[M.Socksaddr]netip.AddrPort
 	serverAddrTime  atomic.TypedValue[time.Time]
@@ -298,17 +315,155 @@ func newWireguardDevice(stack ipStack) (wireguardDevice, error) {
 }
 
 type wgSingErrorHandler struct {
-	name string
+	name            string
+	lastNetWarnNano *atomic.Int64
 }
 
 var _ E.Handler = (*wgSingErrorHandler)(nil)
 
+func isTransientWireGuardSocketError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return true
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr)
+}
+
+func allowThrottledNetWarn(lastNano *atomic.Int64) bool {
+	if lastNano == nil {
+		return true
+	}
+	now := time.Now().UnixNano()
+	prev := lastNano.Load()
+	if prev > 0 && now >= prev && time.Duration(now-prev) < wgNetWarnThrottle {
+		return false
+	}
+	return lastNano.CompareAndSwap(prev, now)
+}
+
 func (w wgSingErrorHandler) NewError(ctx context.Context, err error) {
-	if E.IsClosedOrCanceled(err) {
+	if E.IsClosedOrCanceled(err) || errors.Is(err, net.ErrClosed) || errors.Is(err, os.ErrClosed) {
 		log.SingLogger.Debug(fmt.Sprintf("[WG](%s) connection closed: %s", w.name, err))
 		return
 	}
+	if isTransientWireGuardSocketError(err) {
+		if allowThrottledNetWarn(w.lastNetWarnNano) {
+			log.SingLogger.Warn(fmt.Sprintf("[WG](%s) %s", w.name, err))
+		} else {
+			log.SingLogger.Debug(fmt.Sprintf("[WG](%s) %s", w.name, err))
+		}
+		return
+	}
 	log.SingLogger.Error(fmt.Sprintf("[WG](%s) %s", w.name, err))
+}
+
+// wgBindDialer throttles ClientBind reconnect attempts from the very first
+// failure (preventing sing-wireguard's unthrottled receive() spin loop), resets
+// immediately on Rebind() so newly available routes never pay stale backoff,
+// and wraps canceled bind contexts with net.ErrClosed so amneziawg-go exits its
+// receive loop cleanly without a 333ms deathSpiral sleep.
+type wgBindDialer struct {
+	C.Dialer
+	runCtx   context.Context
+	errCount atomic.Int32
+	mu       sync.Mutex
+	resetCh  chan struct{}
+}
+
+func newWGBindDialer(d C.Dialer, runCtx context.Context) *wgBindDialer {
+	return &wgBindDialer{
+		Dialer:  d,
+		runCtx:  runCtx,
+		resetCh: make(chan struct{}),
+	}
+}
+
+func (d *wgBindDialer) Reset() {
+	if d == nil {
+		return
+	}
+	d.errCount.Store(0)
+	d.mu.Lock()
+	close(d.resetCh)
+	d.resetCh = make(chan struct{})
+	d.mu.Unlock()
+}
+
+func (d *wgBindDialer) waitBeforeRetry(ctx context.Context) error {
+	errs := d.errCount.Load()
+	if errs <= 0 {
+		return nil
+	}
+	d.mu.Lock()
+	resetCh := d.resetCh
+	d.mu.Unlock()
+
+	delay := 100 * time.Millisecond
+	if errs >= 2 {
+		delay = 250 * time.Millisecond
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-resetCh:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("%w: %w", net.ErrClosed, ctx.Err())
+	}
+}
+
+func (d *wgBindDialer) normalizeContext(ctx context.Context) context.Context {
+	if ctx != nil {
+		return ctx
+	}
+	if d.runCtx != nil {
+		return d.runCtx
+	}
+	return context.Background()
+}
+
+func (d *wgBindDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	ctx = d.normalizeContext(ctx)
+	if err := d.waitBeforeRetry(ctx); err != nil {
+		return nil, err
+	}
+	conn, err := d.Dialer.DialContext(ctx, network, address)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("%w: %w", net.ErrClosed, ctx.Err())
+		}
+		d.errCount.Add(1)
+		return nil, err
+	}
+	d.errCount.Store(0)
+	return conn, nil
+}
+
+func (d *wgBindDialer) ListenPacket(ctx context.Context, network, address string, rAddrPort netip.AddrPort) (net.PacketConn, error) {
+	ctx = d.normalizeContext(ctx)
+	if err := d.waitBeforeRetry(ctx); err != nil {
+		return nil, err
+	}
+	pc, err := d.Dialer.ListenPacket(ctx, network, address, rAddrPort)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("%w: %w", net.ErrClosed, ctx.Err())
+		}
+		d.errCount.Add(1)
+		return nil, err
+	}
+	d.errCount.Store(0)
+	return pc, nil
 }
 
 type wgNetDialer struct {
@@ -367,7 +522,9 @@ func NewWireGuard(option WireGuardOption) (*WireGuard, error) {
 		}),
 	}
 	outbound.dialer = option.NewDialer(outbound.DialOptions())
-	singDialer := proxydialer.NewSingDialer(proxydialer.NewSlowDownDialer(outbound.dialer, slowdown.New()))
+	outbound.runCtx, outbound.runCancel = context.WithCancel(context.Background())
+	outbound.bindDialer = newWGBindDialer(outbound.dialer, outbound.runCtx)
+	singDialer := proxydialer.NewSingDialer(outbound.bindDialer)
 
 	var reserved [3]uint8
 	if len(option.Reserved) > 0 {
@@ -385,8 +542,14 @@ func NewWireGuard(option WireGuardOption) (*WireGuard, error) {
 			outbound.connectAddr = option.Addr()
 		}
 	}
-	outbound.runCtx, outbound.runCancel = context.WithCancel(context.Background())
-	outbound.bind = wireguard.NewClientBind(outbound.runCtx, wgSingErrorHandler{outbound.Name()}, singDialer, isConnect, outbound.connectAddr.AddrPort(), reserved)
+	outbound.bind = wireguard.NewClientBind(
+		outbound.runCtx,
+		wgSingErrorHandler{name: outbound.Name(), lastNetWarnNano: &outbound.lastNetWarnNano},
+		singDialer,
+		isConnect,
+		outbound.connectAddr.AddrPort(),
+		reserved,
+	)
 
 	if outbound.bind == nil {
 		return nil, E.New("failed to create wireguard client bind")
@@ -562,7 +725,26 @@ func (w *WireGuard) init0(ctx context.Context) (err error) {
 			log.SingLogger.Debug(fmt.Sprintf("[WG](%s) %s", w.option.Name, fmt.Sprintf(format, args...)))
 		},
 		Errorf: func(format string, args ...interface{}) {
-			log.SingLogger.Error(fmt.Sprintf("[WG](%s) %s", w.option.Name, fmt.Sprintf(format, args...)))
+			msg := fmt.Sprintf("[WG](%s) %s", w.option.Name, fmt.Sprintf(format, args...))
+			for _, arg := range args {
+				err, ok := arg.(error)
+				if !ok || err == nil {
+					continue
+				}
+				if E.IsClosedOrCanceled(err) || errors.Is(err, net.ErrClosed) || errors.Is(err, os.ErrClosed) {
+					log.SingLogger.Debug(msg)
+					return
+				}
+				if isTransientWireGuardSocketError(err) {
+					if allowThrottledNetWarn(&w.lastNetWarnNano) {
+						log.SingLogger.Warn(msg)
+					} else {
+						log.SingLogger.Debug(msg)
+					}
+					return
+				}
+			}
+			log.SingLogger.Error(msg)
 		},
 	}
 	var wgDevice wireguardGoDevice
@@ -604,6 +786,7 @@ func (w *WireGuard) init0(ctx context.Context) (err error) {
 		return err
 	}
 	w.device, w.tunDevice = wgDevice, tunDevice
+	w.lastActiveNano.Store(time.Now().UnixNano())
 	w.initOk.Store(true)
 	return nil
 }
@@ -735,6 +918,7 @@ func (w *WireGuard) genIpcConf(ctx context.Context, updateOnly bool) (string, er
 			}
 
 			if len(w.option.Peers) == 1 { // must call SetConnectAddr if isConnect == true
+				w.bindDialer.Reset()
 				w.bind.SetConnectAddr(destination)
 			}
 			ipcConf += "public_key=" + peer.PublicKey + "\n"
@@ -770,6 +954,7 @@ func (w *WireGuard) genIpcConf(ctx context.Context, updateOnly bool) (string, er
 		} else if updateOnly {
 			return "", nil
 		}
+		w.bindDialer.Reset()
 		w.bind.SetConnectAddr(destination) // must call SetConnectAddr if isConnect == true
 		ipcConf += "public_key=" + w.option.PublicKey + "\n"
 		if updateOnly {
@@ -804,12 +989,74 @@ func (w *WireGuard) genIpcConf(ctx context.Context, updateOnly bool) (string, er
 	return ipcConf, nil
 }
 
+func (w *WireGuard) peerPublicKeysHex() []string {
+	if len(w.option.Peers) > 0 {
+		keys := make([]string, 0, len(w.option.Peers))
+		for _, peer := range w.option.Peers {
+			if peer.PublicKey != "" {
+				keys = append(keys, peer.PublicKey)
+			}
+		}
+		return keys
+	}
+	if w.option.PublicKey != "" {
+		return []string{w.option.PublicKey}
+	}
+	return nil
+}
+
+func (w *WireGuard) isRecentlyActive(now time.Time) bool {
+	last := w.lastActiveNano.Load()
+	return last > 0 && now.Sub(time.Unix(0, last)) <= wgActiveRoamWindow
+}
+
+func reinitiateAmneziaPeer(wgDev wireguardGoDevice, hexPublicKey string) error {
+	switch dev := wgDev.(type) {
+	case roamingHandshakeDevice:
+		return dev.ReinitiatePeerHandshake(hexPublicKey)
+	case *amneziav3.Device:
+		var pk amneziav3.NoisePublicKey
+		if err := pk.FromHex(hexPublicKey); err != nil {
+			return err
+		}
+		peer := dev.LookupPeer(pk)
+		if peer == nil {
+			return nil
+		}
+		peer.ExpireCurrentKeypairs()
+		if err := peer.SendHandshakeInitiation(false); err != nil {
+			// Reset lastSentHandshake so the very first outbound packet once the
+			// route settles triggers a fresh initiation without a 5s cooldown.
+			peer.ExpireCurrentKeypairs()
+			return err
+		}
+		return nil
+	case *amnezia.Device:
+		var pk amnezia.NoisePublicKey
+		if err := pk.FromHex(hexPublicKey); err != nil {
+			return err
+		}
+		peer := dev.LookupPeer(pk)
+		if peer == nil {
+			return nil
+		}
+		peer.ExpireCurrentKeypairs()
+		if err := peer.SendHandshakeInitiation(false); err != nil {
+			peer.ExpireCurrentKeypairs()
+			return err
+		}
+		return nil
+	default:
+		return nil
+	}
+}
+
 // Rebind recreates the underlying ClientBind UDP sockets on the current
-// outbound network (and runs VpnService.protect on Android when TUN is up),
-// then sends an authenticated keepalive so the peer updates our roaming
-// endpoint immediately without waiting for persistent-keepalive.
-// Uninitialized or closed outbounds are skipped so idle country nodes stay
-// asleep and offline ClientBind never enters a spin loop.
+// outbound network (and runs VpnService.protect on Android when TUN is up).
+// For recently active AmneziaWG outbounds it forces a fresh CPS (I1..I5 + junk)
+// handshake so stateful carrier DPI on a new CGNAT 5-tuple does not drop bare
+// transport keepalives for 15 seconds. Standard WireGuard and idle outbounds
+// keep the lightweight keepalive path.
 func (w *WireGuard) Rebind() {
 	if !w.initOk.Load() || (w.runCtx != nil && w.runCtx.Err() != nil) {
 		return
@@ -819,10 +1066,47 @@ func (w *WireGuard) Rebind() {
 	if !w.initOk.Load() || (w.runCtx != nil && w.runCtx.Err() != nil) || w.device == nil {
 		return
 	}
+	w.bindDialer.Reset()
+	if err := w.device.Up(); err != nil {
+		log.Warnln("[WG](%s) Rebind device up failed: %s", w.Name(), err)
+		return
+	}
 	if err := w.device.BindUpdate(); err != nil {
 		log.Warnln("[WG](%s) Rebind failed: %s", w.Name(), err)
 		return
 	}
+	w.bindDialer.Reset()
+
+	now := time.Now()
+	if w.option.AmneziaWGOption != nil && w.isRecentlyActive(now) {
+		keys := w.peerPublicKeysHex()
+		if len(keys) > 0 {
+			if !w.lastRebindHandshake.IsZero() {
+				if gap := wgMinRebindHandshakeGap - now.Sub(w.lastRebindHandshake); gap > 0 {
+					timer := time.NewTimer(gap)
+					if w.runCtx != nil {
+						select {
+						case <-timer.C:
+						case <-w.runCtx.Done():
+							timer.Stop()
+							return
+						}
+					} else {
+						<-timer.C
+					}
+				}
+			}
+			w.lastRebindHandshake = time.Now()
+			log.Debugln("[WG](%s) Rebind succeeded, initiating fresh AmneziaWG handshake", w.Name())
+			for _, hexKey := range keys {
+				if err := reinitiateAmneziaPeer(w.device, hexKey); err != nil {
+					log.Debugln("[WG](%s) Rebind handshake initiation deferred: %s", w.Name(), err)
+				}
+			}
+			return
+		}
+	}
+
 	log.Debugln("[WG](%s) Rebind succeeded, sending keepalive", w.Name())
 	w.device.SendKeepalivesToPeersWithCurrentKeypair()
 }
@@ -830,6 +1114,7 @@ func (w *WireGuard) Rebind() {
 // Close implements C.ProxyAdapter
 func (w *WireGuard) Close() error {
 	w.runCancel()
+	w.bindDialer.Reset()
 	w.deviceMutex.Lock()
 	wgDevice := w.device
 	w.deviceMutex.Unlock()
@@ -844,6 +1129,7 @@ func (w *WireGuard) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.
 	if err = w.init(ctx); err != nil {
 		return nil, err
 	}
+	w.lastActiveNano.Store(time.Now().UnixNano())
 	if !metadata.Resolved() || w.resolver != nil {
 		r := resolver.DefaultResolver
 		if w.resolver != nil {
@@ -870,6 +1156,7 @@ func (w *WireGuard) ListenPacketContext(ctx context.Context, metadata *C.Metadat
 	if err = w.init(ctx); err != nil {
 		return nil, err
 	}
+	w.lastActiveNano.Store(time.Now().UnixNano())
 	if err = w.ResolveUDP(ctx, metadata); err != nil {
 		return nil, err
 	}

@@ -2,6 +2,7 @@ package sing_tun
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/netip"
 	"sync"
@@ -18,6 +19,10 @@ import (
 	"github.com/metacubex/sing/common/network"
 )
 
+const dotPort = 853
+
+var errRejectLocalDoT = errors.New("reject DoT/DoQ probe to local TUN address")
+
 func (h *ListenerHandler) ShouldHijackDns(targetAddr netip.AddrPort) bool {
 	for _, addrPort := range h.DnsAddrPorts {
 		if addrPort == targetAddr || (addrPort.Addr().IsUnspecified() && targetAddr.Port() == 53) {
@@ -27,16 +32,64 @@ func (h *ListenerHandler) ShouldHijackDns(targetAddr netip.AddrPort) bool {
 	return false
 }
 
+// ShouldRejectLocalDoT matches Opportunistic Private DNS probes (:853) aimed
+// solely at the local TUN subnet (/30 IPv4, /126 IPv6) or explicit local TUN
+// DNS addresses, while leaving Strict Private DNS (FakeIP >= .4 or public IPs)
+// completely untouched.
+func (h *ListenerHandler) ShouldRejectLocalDoT(targetAddr netip.AddrPort) bool {
+	if targetAddr.Port() != dotPort {
+		return false
+	}
+	addr := targetAddr.Addr().Unmap()
+	if !addr.IsValid() {
+		return false
+	}
+	for _, prefix := range h.Inet4Address {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	for _, prefix := range h.Inet6Address {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	for _, addrPort := range h.DnsAddrPorts {
+		dnsAddr := addrPort.Addr().Unmap()
+		if dnsAddr.IsValid() && !dnsAddr.IsUnspecified() && dnsAddr == addr {
+			return true
+		}
+	}
+	return false
+}
+
 func (h *ListenerHandler) NewConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error {
-	if h.ShouldHijackDns(metadata.Destination.AddrPort()) {
+	target := metadata.Destination.AddrPort()
+	if h.ShouldHijackDns(target) {
 		log.Debugln("[DNS] hijack tcp:%s", metadata.Destination.String())
 		return resolver.RelayDnsConn(ctx, conn, resolver.DefaultDnsReadTimeout)
+	}
+	if h.ShouldRejectLocalDoT(target) {
+		// For TUN stacks (C.TUN), return non-nil error WITHOUT calling conn.Close()
+		// so gvisor (endpoint.Abort) and mipstack/system/mixed (SetLinger(0)) emit
+		// an immediate TCP RST instead of a graceful FIN. For Linux auto-redirect
+		// (C.REDIR), sing-tun's redirectServer ignores NewConnection's error return
+		// and does not close conn, so close with SO_LINGER=0 explicitly there.
+		log.Debugln("[DNS] reject local DoT tcp:%s", metadata.Destination.String())
+		if h.ListenerHandler != nil && h.Type == C.REDIR {
+			if tcpConn, ok := conn.(*net.TCPConn); ok {
+				_ = tcpConn.SetLinger(0)
+			}
+			_ = conn.Close()
+		}
+		return errRejectLocalDoT
 	}
 	return h.ListenerHandler.NewConnection(ctx, conn, metadata)
 }
 
 func (h *ListenerHandler) NewPacket(ctx context.Context, key netip.AddrPort, buffer *buf.Buffer, metadata M.Metadata, init func(natConn network.PacketConn) network.PacketWriter) {
-	if h.ShouldHijackDns(metadata.Destination.AddrPort()) {
+	target := metadata.Destination.AddrPort()
+	if h.ShouldHijackDns(target) {
 		log.Debugln("[DNS] hijack udp:%s from %s", metadata.Destination.String(), metadata.Source.String())
 		writer := init(nil)
 		rwOptions := network.ReadWaitOptions{
@@ -47,11 +100,17 @@ func (h *ListenerHandler) NewPacket(ctx context.Context, key netip.AddrPort, buf
 		go relayDnsPacket(ctx, buffer, rwOptions, metadata.Destination, nil, &writer)
 		return
 	}
+	if h.ShouldRejectLocalDoT(target) {
+		log.Debugln("[DNS] drop local DoQ udp:%s from %s", metadata.Destination.String(), metadata.Source.String())
+		buffer.Release()
+		return
+	}
 	h.ListenerHandler.NewPacket(ctx, key, buffer, metadata, init)
 }
 
 func (h *ListenerHandler) NewPacketConnection(ctx context.Context, conn network.PacketConn, metadata M.Metadata) error {
-	if h.ShouldHijackDns(metadata.Destination.AddrPort()) {
+	target := metadata.Destination.AddrPort()
+	if h.ShouldHijackDns(target) {
 		log.Debugln("[DNS] hijack udp:%s from %s", metadata.Destination.String(), metadata.Source.String())
 		defer func() { _ = conn.Close() }()
 		mutex := sync.Mutex{}
@@ -99,6 +158,11 @@ func (h *ListenerHandler) NewPacketConnection(ctx context.Context, conn network.
 			go relayDnsPacket(ctx, readBuff, rwOptions, dest, &mutex, &writer)
 		}
 		return nil
+	}
+	if h.ShouldRejectLocalDoT(target) {
+		log.Debugln("[DNS] reject local DoQ udp:%s from %s", metadata.Destination.String(), metadata.Source.String())
+		_ = conn.Close()
+		return errRejectLocalDoT
 	}
 	return h.ListenerHandler.NewPacketConnection(ctx, conn, metadata)
 }

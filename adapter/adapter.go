@@ -3,6 +3,7 @@ package adapter
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -167,8 +168,11 @@ func (p *Proxy) URLTest(ctx context.Context, url string, expectedStatus utils.In
 	var satisfied bool
 
 	defer func() {
+		if err != nil && errors.Is(ctx.Err(), context.Canceled) && !errors.Is(context.Cause(ctx), context.DeadlineExceeded) {
+			return
+		}
 		if UrlTestHook != nil {
-			UrlTestHook(url, p.Name(), t, ctx.Err() != nil)
+			UrlTestHook(url, p.Name(), t, ctx.Err() != nil || errors.Is(context.Cause(ctx), context.DeadlineExceeded))
 		}
 
 		alive := err == nil

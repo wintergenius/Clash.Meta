@@ -48,3 +48,25 @@ func (bp *baseProvider) TestTimeout(url string) (time.Duration, bool) {
 	_, tested := hc.extra[url]
 	return hc.timeout, tested
 }
+
+// RecentlyActive reports whether a health-checked provider is non-lazy or was
+// touched within max(window, interval), allowing post-roam probes to stay
+// silent during deep background sleep (Android Doze) when no traffic flows.
+func (bp *baseProvider) RecentlyActive(window time.Duration) bool {
+	hc := bp.healthCheck
+	if hc == nil || strings.TrimSpace(hc.url) == "" {
+		return false
+	}
+	if !hc.lazy {
+		return true
+	}
+	lastTouch := hc.lastTouch.Load()
+	if lastTouch.IsZero() {
+		return false
+	}
+	limit := window
+	if hc.interval > limit {
+		limit = hc.interval
+	}
+	return time.Since(lastTouch) <= limit
+}
