@@ -38,6 +38,12 @@ type BrutalOption struct {
 	Down    string `proxy:"down,omitempty"`
 }
 
+func (s *SingMux) Rebind() {
+	if rebinder, ok := s.ProxyAdapter.(interface{ Rebind() }); ok {
+		rebinder.Rebind()
+	}
+}
+
 func (s *SingMux) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
 	c, err := s.client.DialContext(ctx, "tcp", M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort))
 	if err != nil {

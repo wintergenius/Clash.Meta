@@ -3,9 +3,18 @@ package tunnel
 import (
 	"sync"
 
+	"github.com/metacubex/mihomo/component/iface"
 	C "github.com/metacubex/mihomo/constant"
 	P "github.com/metacubex/mihomo/constant/provider"
+	"github.com/metacubex/mihomo/tunnel/statistic"
 )
+
+func init() {
+	statistic.IsDirect = func(name string) bool {
+		proxy, ok := AllProxies()[name]
+		return ok && proxy.Type() == C.Direct
+	}
+}
 
 var (
 	allProxiesMu sync.Mutex
@@ -101,4 +110,62 @@ func RuleProvidersSnapshot() map[string]P.RuleProvider {
 	configMux.RLock()
 	defer configMux.RUnlock()
 	return ruleProviders
+}
+
+// ResolveRoute picks the adapter a connection for metadata would be handed
+// to, by the same steps an incoming connection takes, without dialing it.
+func ResolveRoute(metadata *C.Metadata) (C.Proxy, error) {
+	fixMetadata(metadata)
+	if err := preHandleMetadata(metadata); err != nil {
+		return nil, err
+	}
+	proxy, _, err := resolveMetadata(metadata)
+	return proxy, err
+}
+
+type rebindableAdapter interface {
+	Rebind()
+}
+
+// ResetWireGuardBinds flushes the interface cache and rebinds every
+// initialized WireGuard/AmneziaWG outbound across direct proxies and proxy
+// providers, deduplicating shared adapter instances.
+func ResetWireGuardBinds() {
+	iface.FlushCache()
+
+	configMux.RLock()
+	seen := make(map[C.ProxyAdapter]struct{})
+	var targets []rebindableAdapter
+	collect := func(p C.Proxy) {
+		if p == nil {
+			return
+		}
+		inner := p.Adapter()
+		if inner == nil {
+			return
+		}
+		if _, exists := seen[inner]; exists {
+			return
+		}
+		seen[inner] = struct{}{}
+		if rebinder, ok := inner.(rebindableAdapter); ok {
+			targets = append(targets, rebinder)
+		}
+	}
+	for _, p := range proxies {
+		collect(p)
+	}
+	for _, prov := range providers {
+		if prov == nil {
+			continue
+		}
+		for _, p := range prov.Proxies() {
+			collect(p)
+		}
+	}
+	configMux.RUnlock()
+
+	for _, target := range targets {
+		target.Rebind()
+	}
 }
